@@ -25,6 +25,98 @@ fi
 
 die() { echo -e "${RED}error:${RESET} $*" >&2; exit 1; }
 
+_realpath() {
+    local p="${1/#\~/$HOME}"
+    [[ "$p" != /* ]] && p="$(pwd)/$p"
+    ( cd "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
+}
+
+# Expand an input to matching filesystem directories.
+# On ambiguity: prints "AMBIGUOUS" then the candidates and returns 1.
+# 1. Exact resolved path  2. Wildcard glob  3. Substring match in parent dir
+_expand_path() {
+    local input="$1"
+    local resolved
+    resolved="$(_realpath "$input")"
+    if [[ -d "$resolved" ]]; then
+        echo "$resolved"
+        return 0
+    fi
+    local parent base abs_parent
+    parent="$(dirname "$input")"
+    base="$(basename "$input")"
+    abs_parent="$(_realpath "$parent")"
+    if [[ "$input" == *'*'* || "$input" == *'?'* ]]; then
+        for match in "$abs_parent"/$base; do
+            [[ -d "$match" ]] && echo "$match"
+        done
+        return 0
+    fi
+    local matches=()
+    for match in "$abs_parent"/*/; do
+        [[ -d "$match" ]] || continue
+        local name
+        name="$(basename "${match%/}")"
+        [[ "$name" == *"$base"* ]] && matches+=("${match%/}")
+    done
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        echo "${matches[0]}"
+    elif [[ ${#matches[@]} -gt 1 ]]; then
+        echo "AMBIGUOUS"
+        printf '%s\n' "${matches[@]}"
+        return 1
+    fi
+}
+
+# Match an input against registered roots.
+# 1. Exact full-path  2. Exact basename  3. Substring basename  4. Wildcard basename
+# Returns matching paths on stdout; prints an error and returns 1 on ambiguity.
+_match_roots() {
+    local input="$1"
+    local resolved
+    resolved="$(_realpath "$input")"
+    if grep -qxF "$resolved" "$ROOTS_FILE" 2>/dev/null; then
+        echo "$resolved"
+        return 0
+    fi
+    local matches=()
+    while IFS= read -r root; do
+        local base
+        base="$(basename "$root")"
+        if [[ "$base" == "$input" ]]; then
+            matches+=("$root")
+        fi
+    done < <(get_roots)
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        printf '%s\n' "${matches[@]}"
+        return 0
+    fi
+    # Substring match
+    while IFS= read -r root; do
+        local base
+        base="$(basename "$root")"
+        if [[ "$base" == *"$input"* ]]; then
+            matches+=("$root")
+        fi
+    done < <(get_roots)
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        echo "${matches[0]}"
+        return 0
+    elif [[ ${#matches[@]} -gt 1 ]]; then
+        echo "AMBIGUOUS"
+        printf '%s\n' "${matches[@]}"
+        return 1
+    fi
+    # Wildcard match
+    if [[ "$input" == *'*'* || "$input" == *'?'* ]]; then
+        while IFS= read -r root; do
+            case "$(basename "$root")" in
+                $input) printf '%s\n' "$root" ;;
+            esac
+        done < <(get_roots)
+    fi
+}
+
 ensure_config() {
     mkdir -p "$CONFIG_DIR"
     touch "$ROOTS_FILE"
@@ -82,53 +174,81 @@ cmd_config() {
             [[ $# -lt 2 ]] && die "usage: mugit config --add <folder> [folder2...]"
             local added=0
             local lines=()
-            local sorted_folders
-            mapfile -t sorted_folders < <(printf '%s\n' "${@:2}" | sort)
-            for folder in "${sorted_folders[@]}"; do
-                folder="$(realpath -m "$folder")"
-                if [[ ! -d "$folder" ]]; then
-                    lines+=("${RED}not found:${RESET} $folder")
-                elif grep -qxF "$folder" "$ROOTS_FILE" 2>/dev/null; then
-                    lines+=("${YELLOW}already registered:${RESET} $folder")
-                else
-                    local count
-                    count=$(repos_in_root "$folder" | grep -c . || true)
-                    if [[ $count -eq 0 ]]; then
-                        lines+=("${RED}skipped:${RESET} $folder ${YELLOW}(no repos found)${RESET}")
+            local inputs=()
+            while IFS= read -r _line; do inputs+=("$_line"); done < <(printf '%s\n' "${@:2}" | sort)
+            for input in "${inputs[@]}"; do
+                local _out _rc
+                _out="$(_expand_path "$input")"
+                _rc=$?
+                if [[ $_rc -ne 0 ]]; then
+                    local _cands=()
+                    while IFS= read -r _line; do
+                        [[ "$_line" != "AMBIGUOUS" ]] && _cands+=("$_line")
+                    done <<< "$_out"
+                    lines+=("${YELLOW}ambiguous:${RESET} '$input' matches:")
+                    local _c; for _c in "${_cands[@]+"${_cands[@]}"}"; do lines+=("  $(basename "$_c")  ${YELLOW}($_c)${RESET}"); done
+                    continue
+                fi
+                local expanded=()
+                while IFS= read -r _line; do [[ -n "$_line" ]] && expanded+=("$_line"); done <<< "$_out"
+                if [[ ${#expanded[@]} -eq 0 ]]; then
+                    lines+=("${RED}not found:${RESET} $input")
+                    continue
+                fi
+                for folder in "${expanded[@]}"; do
+                    if grep -qxF "$folder" "$ROOTS_FILE" 2>/dev/null; then
+                        lines+=("${YELLOW}already registered:${RESET} $folder")
                     else
-                        echo "$folder" >> "$ROOTS_FILE"
-                        (( added++ )) || true
-                        if [[ -d "$folder/.git" ]]; then
-                            lines+=("${GREEN}added:${RESET} $folder ${CYAN}(is a repo)${RESET}")
+                        local count
+                        count=$(repos_in_root "$folder" | grep -c . || true)
+                        if [[ $count -eq 0 ]]; then
+                            lines+=("${RED}skipped:${RESET} $folder ${YELLOW}(no repos found)${RESET}")
                         else
-                            lines+=("${GREEN}added:${RESET} $folder ${CYAN}(has $count repo(s))${RESET}")
+                            echo "$folder" >> "$ROOTS_FILE"
+                            (( added++ )) || true
+                            if [[ -d "$folder/.git" ]]; then
+                                lines+=("${GREEN}added:${RESET} $folder ${CYAN}(is a repo)${RESET}")
+                            else
+                                lines+=("${GREEN}added:${RESET} $folder ${CYAN}(has $count repo(s))${RESET}")
+                            fi
                         fi
                     fi
-                fi
+                done
             done
             echo -e "${BOLD}$added root(s) added${RESET}"
-            for line in "${lines[@]}"; do
-                echo -e "  $line"
-            done
+            local _l; for _l in "${lines[@]+"${lines[@]}"}"; do echo -e "  $_l"; done
             ;;
         --rm|-r)
             [[ $# -lt 2 ]] && die "usage: mugit config --rm <folder> [folder2...]"
             local removed=0
             local lines=()
-            for folder in "${@:2}"; do
-                folder="$(realpath -m "$folder")"
-                if ! grep -qxF "$folder" "$ROOTS_FILE" 2>/dev/null; then
-                    lines+=("${YELLOW}not found:${RESET} $folder")
-                else
-                    sed -i "\|^${folder}$|d" "$ROOTS_FILE"
+            for input in "${@:2}"; do
+                local _out _rc
+                _out="$(_match_roots "$input")"
+                _rc=$?
+                if [[ $_rc -ne 0 ]]; then
+                    local _cands=()
+                    while IFS= read -r _line; do
+                        [[ "$_line" != "AMBIGUOUS" ]] && _cands+=("$_line")
+                    done <<< "$_out"
+                    lines+=("${YELLOW}ambiguous:${RESET} '$input' matches:")
+                    local _c; for _c in "${_cands[@]+"${_cands[@]}"}"; do lines+=("  $(basename "$_c")  ${YELLOW}($_c)${RESET}"); done
+                    continue
+                fi
+                local matches=()
+                while IFS= read -r _line; do [[ -n "$_line" ]] && matches+=("$_line"); done <<< "$_out"
+                if [[ ${#matches[@]} -eq 0 ]]; then
+                    lines+=("${YELLOW}not found:${RESET} $input")
+                    continue
+                fi
+                for folder in "${matches[@]}"; do
+                    sed -i '' "\|^${folder}$|d" "$ROOTS_FILE"
                     (( removed++ )) || true
                     lines+=("${RED}removed:${RESET} $folder")
-                fi
+                done
             done
             echo -e "${BOLD}$removed root(s) removed${RESET}"
-            for line in "${lines[@]}"; do
-                echo -e "  $line"
-            done
+            local _l; for _l in "${lines[@]+"${lines[@]}"}"; do echo -e "  $_l"; done
             ;;
         --clean|-c)
             > "$ROOTS_FILE"
@@ -155,7 +275,7 @@ cmd_config() {
                         echo -e "  ${CYAN}$(basename "$root")${RESET}  ${YELLOW}$root${RESET}"
                     else
                         local sub_repos=()
-                        mapfile -t sub_repos < <(repos_in_root "$root" | sort)
+                        while IFS= read -r _line; do sub_repos+=("$_line"); done < <(repos_in_root "$root" | sort)
                         local count=${#sub_repos[@]}
                         echo -e "  ${CYAN}$root${RESET}  ${YELLOW}($count repo(s))${RESET}"
                         for i in "${!sub_repos[@]}"; do
